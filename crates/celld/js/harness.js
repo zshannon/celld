@@ -760,6 +760,10 @@ const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
   response.url = req.url;
   return response;
 };
+__celld.__makeSecretsStoreSecret = (binding) => ({
+  async get() { return __secret_get(binding); },
+});
+
 __celld.__makeAssetsBinding = (script) => ({
   async fetch(input, init) {
     const req = input instanceof Request ? new Request(input, init) : new Request(input, init);

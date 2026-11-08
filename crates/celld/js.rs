@@ -336,6 +336,7 @@ pub fn submit_do_call(call: DoCallReq) -> bool {
 }
 
 pub use r2_ops::set_r2_store;
+mod secrets_ops;
 
 /// Sample the source under its SQLite lock. A missing source cannot grant
 /// publication or cleanup authority; the output gate fails closed for an arm.
@@ -1896,6 +1897,7 @@ pub struct WorkerConfig {
     /// the config's `id` verbatim, and it addresses the namespace's cells; see
     /// [[kv]].
     kv_bindings: Vec<(String, String)>,
+    secret_bindings: Vec<celld_secrets::SecretBinding>,
     queue_bindings: Vec<QueueBinding>,
     pub(crate) queue_consumers: Vec<QueueConsumerRegistration>,
     /// This script declared a consumer in its own manifest. The deployment-
@@ -2023,6 +2025,7 @@ impl WorkerConfig {
             r2_bindings,
             d1_bindings,
             kv_bindings,
+            secret_bindings,
             queue_bindings,
             queue_consumers,
             workflow_bindings,
@@ -2053,6 +2056,7 @@ impl WorkerConfig {
             r2_bindings,
             d1_bindings,
             kv_bindings,
+            secret_bindings,
             queue_bindings,
             queue_consumers,
             declares_queue_consumer,
@@ -2436,6 +2440,7 @@ enum EgressPolicy {
 
 #[derive(Default)]
 struct ActorRuntimeState {
+    secret_bindings: HashMap<String, celld_secrets::SecretBinding>,
     promises: std::sync::Mutex<PromiseMap>,
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
@@ -5823,6 +5828,11 @@ impl Worker {
             forced_admission_refusal: AtomicBool::new(false),
         });
         let runtime_state = Arc::new(ActorRuntimeState {
+            secret_bindings: config
+                .secret_bindings
+                .iter()
+                .map(|binding| (binding.name.clone(), binding.clone()))
+                .collect(),
             promises: std::sync::Mutex::new(PromiseMap::new()),
             egress: config.egress.clone(),
             resource_limits: config.resource_limits,
@@ -6828,6 +6838,7 @@ ops! { OP_NAMES, install_op_functions,
         "__structured_clone" => storage_ops::op_structured_clone,
         "__op_fetch" => op_fetch,
         "__r2_head" => r2_ops::op_r2_head,
+        "__secret_get" => secrets_ops::get,
         "__r2_get" => r2_ops::op_r2_get,
         "__r2_put" => r2_ops::op_r2_put,
         "__r2_put_begin" => r2_ops::op_r2_put_begin,
@@ -7671,6 +7682,7 @@ fn op_loader_load(
             // ambient bindings are exactly what Code Mode withholds.
             d1_bindings: Vec::new(),
             kv_bindings: Vec::new(),
+            secret_bindings: Vec::new(),
             queue_bindings: Vec::new(),
             queue_consumers: Vec::new(),
             workflow_bindings: Vec::new(),

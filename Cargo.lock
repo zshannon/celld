@@ -297,6 +297,8 @@ dependencies = [
  "cbc",
  "celld-logic",
  "celld-ltx",
+ "celld-secrets",
+ "celld-secrets-1password",
  "chrono",
  "crc",
  "ctr",
