@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/connect-1password"]
 
 # Size-tuned: fat LTO prunes unused dependency code, panic=abort drops
 # unwind tables. opt-level "s" (not "z") — measure RPS before trading further.
@@ -44,6 +45,9 @@ base64 = "0.22"
 bytes = "1"
 celld-logic = { path = "crates/logic" }
 celld-ltx = { path = "crates/ltx" }
+celld-secrets = { path = "crates/secrets" }
+celld-secrets-1password = { path = "crates/secrets-1password" }
+connect-1password = "=2.0.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 encoding_rs = "0.8"
@@ -161,3 +165,6 @@ urlpattern = "=0.4.2"
 v8 = "152.1"
 # 1.0.10 drops the emSign ECC root, whose intermediate CA keys are public.
 webpki-roots = "1.0.10"
+
+[patch.crates-io]
+connect-1password = { path = "vendor/connect-1password" }
