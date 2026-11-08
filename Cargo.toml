@@ -145,7 +145,8 @@ thiserror = "2"
 # hard-cap latch stayed closed after a node shed its cells.
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tikv-jemallocator = { version = "0.6", features = ["background_threads", "stats"] }
-tokio = "1"
+# RUSTSEC-2026-0386 fixes AsyncFd I/O safety in the 1.53 release line.
+tokio = "1.53.3"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io", "time"] }
