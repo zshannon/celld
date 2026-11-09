@@ -90,7 +90,7 @@ The release image contains the `celld` binary and is published for Linux
 x86-64 and ARM64:
 
 ```sh
-docker run --rm ghcr.io/denoland/celld --version
+docker run --rm ghcr.io/zshannon/celld --version
 ```
 
 Persist the runtime's local state and pass the standard AWS credential
@@ -104,7 +104,7 @@ docker run --rm --network host \
   -e AWS_SESSION_TOKEN \
   -e CELLD_WATCH=/var/lib/celld/state \
   -v celld-state:/var/lib/celld \
-  ghcr.io/denoland/celld \
+  ghcr.io/zshannon/celld \
   --bucket s3://my-cells-bucket \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
   --region auto \
