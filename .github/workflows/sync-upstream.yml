@@ -1,0 +1,50 @@
+name: Check upstream
+
+on:
+  schedule:
+    # Mondays at 16:17 UTC, matching the existing fork maintenance schedule.
+    - cron: '17 16 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/scripts/*sync-upstream.cjs'
+      - '.github/workflows/sync-upstream.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Test upstream proposal behavior
+        run: node --test .github/scripts/test-sync-upstream.cjs
+
+  upstream-pr:
+    if: github.event_name != 'pull_request' && github.repository == 'zshannon/celld' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Open an upstream draft when needed
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const syncUpstream = require('./.github/scripts/sync-upstream.cjs');
+            await syncUpstream({ context, core, github });
