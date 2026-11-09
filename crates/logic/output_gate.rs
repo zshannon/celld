@@ -5,7 +5,7 @@
 //! # The rule
 //!
 //! Nothing that reveals a cell's state may leave this process while that cell
-//! has a write it cannot prove durable. A client told about a write that a
+//! has a confirmation-required write it cannot prove durable. A client told about a write that a
 //! crash then discards has been told something false, and no later message can
 //! retract a side effect that has already left.
 //!
@@ -26,11 +26,9 @@
 //! | release only revealable state | the output's barrier, or the barrier it trails, has settled |
 //! | let the held effect leave | [`Effect::Release`] with `Ok` |
 //!
-//! **The core does not read the channel.** It stores what the shell gave it and
-//! hands the same value back. A `match` on [`Channel`] inside this module would
-//! split the invariant into one independent rule per channel. Per-channel code
-//! belongs in the shell and is limited to how an effect is held and how it is
-//! released.
+//! All external channels share one rule. [`Channel::Sync`] is an explicit
+//! durability waiter, not an external output: its barrier waits for all writes
+//! but does not recruit unrelated outputs behind unconfirmed writes.
 //!
 //! # Why one choke point
 //!
@@ -70,13 +68,25 @@
 
 use crate::*;
 
+impl Barrier {
+    fn blocks_output(&self) -> bool {
+        !matches!(
+            self.owner,
+            GateOwner::Output(Held {
+                channel: Channel::Sync,
+                ..
+            })
+        )
+    }
+}
+
 impl State {
     /// **The output gate. Every channel passes through here.**
     ///
     /// The implementation contract is meant to be checked line by line:
     ///
-    /// - `channel` names the route. This function stores it but does not branch
-    ///   on it, so every channel uses one rule.
+    /// - `channel` names the route. External outputs share one rule; explicit
+    ///   sync waiters prove their position without holding other outputs.
     /// - no barrier means that no unproven write remains for this output to
     ///   reveal, so the core emits [`Effect::Release`] with `Ok`.
     ///
@@ -178,7 +188,10 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         if let Some((_, barrier)) = self.barriers.iter_mut().rev().find(|(_, barrier)| {
-            barrier.cell == cell && barrier.epoch == epoch && barrier.position >= observed
+            barrier.cell == cell
+                && barrier.epoch == epoch
+                && barrier.position >= observed
+                && barrier.blocks_output()
         }) {
             barrier.followers.push(held);
             return;
@@ -213,6 +226,14 @@ impl State {
             });
             return;
         };
+        if self.proven_covers(&cell, epoch, position) {
+            effects.push(Effect::Release {
+                request,
+                channel: held.channel,
+                result: Ok(()),
+            });
+            return;
+        }
         let op = self.op();
         self.barriers.insert(
             op,
@@ -262,7 +283,7 @@ impl State {
             .barriers
             .iter_mut()
             .rev()
-            .find(|(_, barrier)| barrier.cell == cell)
+            .find(|(_, barrier)| barrier.cell == cell && barrier.blocks_output())
         {
             barrier.followers.push(held);
         } else {
@@ -393,5 +414,174 @@ impl State {
             let (id, epoch) = (gate.cell.clone(), gate.epoch);
             self.reset_cell(&id, epoch, effects);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resident() -> State {
+        let mut state = State::new(
+            "test",
+            Config {
+                max_resident: 1,
+                max_activations: 1,
+                max_evictions: 1,
+                max_releases: 1,
+                max_outbound_websockets: 1,
+                ownership_on_evict: OwnershipOnEvict::Release,
+                require_node_lease: false,
+                peer_protocol: 1,
+                operation_deadline_ms: None,
+                owner_log_recovery_backoff_ms: 0,
+                owner_log_recovery_attempts: 1,
+                alarm_resident_ms: 0,
+                idle_evict_ms: None,
+                pressure: Default::default(),
+            },
+        );
+        state.cells.insert(
+            "cell".into(),
+            Cell {
+                phase: Phase::Resident { epoch: 1 },
+                ..Default::default()
+            },
+        );
+        state.occupied = 1;
+        for request in 1..=3 {
+            state.activate_request(request, "cell".into());
+        }
+        state
+    }
+
+    fn output(
+        state: &mut State,
+        request: u64,
+        channel: Channel,
+        position: Option<u64>,
+        observed: Option<u64>,
+    ) -> Vec<Effect> {
+        on_event(
+            state,
+            Event::Output {
+                request,
+                channel,
+                position,
+                observed,
+                epoch: Some(1),
+            },
+        )
+    }
+
+    fn waiting(effects: &[Effect], expected: u64) -> OpId {
+        let [Effect::AwaitDurable { op, position, .. }] = effects else {
+            panic!("expected durability wait, got {effects:?}")
+        };
+        assert_eq!(*position, expected);
+        *op
+    }
+
+    fn released(effects: &[Effect], expected: u64) -> bool {
+        effects.iter().any(|effect| matches!(effect, Effect::Release { request, result: Ok(()), .. } if *request == expected))
+    }
+
+    fn prove(state: &mut State, op: OpId, position: u64) -> Vec<Effect> {
+        on_event(
+            state,
+            Event::DurableReached {
+                op,
+                result: Ok(position),
+                source: ProofSource::Fleet,
+            },
+        )
+    }
+
+    #[test]
+    fn sync_waits_for_proof_without_holding_any_network_channel() {
+        let mut state = resident();
+        let op = waiting(&output(&mut state, 1, Channel::Sync, Some(20), None), 20);
+        for channel in [
+            Channel::Response,
+            Channel::Fetch,
+            Channel::WsHibernatable,
+            Channel::WsSelf,
+            Channel::Service,
+            Channel::CellRpc,
+            Channel::R2,
+            Channel::Tcp,
+            Channel::Queue,
+        ] {
+            let effects = output(&mut state, 2, channel, None, None);
+            assert!(released(&effects, 2), "{channel:?}: {effects:?}");
+            assert!(!released(&effects, 1));
+        }
+        assert!(released(&prove(&mut state, op, 20), 1));
+    }
+
+    #[test]
+    fn confirmed_reader_does_not_join_a_later_sync_wait() {
+        let mut state = resident();
+        let sync = waiting(&output(&mut state, 1, Channel::Sync, Some(20), None), 20);
+        let reader = waiting(
+            &output(&mut state, 2, Channel::Response, None, Some(10)),
+            10,
+        );
+        let effects = prove(&mut state, reader, 10);
+        assert!(released(&effects, 2));
+        assert!(!released(&effects, 1));
+        assert!(released(&prove(&mut state, sync, 20), 1));
+    }
+
+    #[test]
+    fn ordinary_write_still_holds_readers_while_sync_is_pending() {
+        let mut state = resident();
+        let write = waiting(
+            &output(&mut state, 1, Channel::Response, Some(10), None),
+            10,
+        );
+        let sync = waiting(&output(&mut state, 2, Channel::Sync, Some(20), None), 20);
+        assert!(output(&mut state, 3, Channel::Fetch, None, None).is_empty());
+        let effects = prove(&mut state, write, 10);
+        assert!(released(&effects, 1));
+        assert!(released(&effects, 3));
+        assert!(!released(&effects, 2));
+        assert!(released(&prove(&mut state, sync, 20), 2));
+    }
+
+    #[test]
+    fn already_proven_write_does_not_wait_for_another_capture() {
+        let mut state = resident();
+        let op = waiting(
+            &output(&mut state, 1, Channel::Response, Some(10), None),
+            10,
+        );
+        prove(&mut state, op, 10);
+        assert!(released(
+            &output(&mut state, 2, Channel::Fetch, Some(10), None),
+            2
+        ));
+    }
+
+    #[test]
+    fn failed_sync_rejects_instead_of_claiming_durability() {
+        let mut state = resident();
+        let op = waiting(&output(&mut state, 1, Channel::Sync, Some(20), None), 20);
+        let effects = on_event(
+            &mut state,
+            Event::DurableReached {
+                op,
+                result: Err(Failure::Definite),
+                source: ProofSource::Fleet,
+            },
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 1,
+                result: Err(RequestError::DurabilityUnproven),
+                ..
+            }
+        )));
     }
 }
