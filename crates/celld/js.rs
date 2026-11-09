@@ -2416,7 +2416,7 @@ fn admission_refusal_forced(_state: &HeapLimitState) -> bool {
 }
 
 type SerializedPut = (String, Vec<u8>);
-type PendingPuts = HashMap<String, Vec<SerializedPut>>;
+type PendingPuts = HashMap<String, (Vec<SerializedPut>, bool)>;
 
 /// One Fetcher route transferred from a Worker Loader parent into its child.
 /// The generation and the complete target travel together, so a loaded Worker
@@ -12692,3 +12692,197 @@ pub fn init_engine_for_tests() {
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+
+#[cfg(test)]
+mod unconfirmed_tests {
+    use super::*;
+    use std::task::{Context, Poll, Waker};
+
+    fn eval<'s>(scope: &mut v8::PinScope<'s, '_>, source: &str) -> v8::Local<'s, v8::Value> {
+        let arguments = internal_arguments(scope);
+        let code = v8::String::new(scope, source).unwrap();
+        bootstrap::run_internal_script(scope, None, code, &arguments).unwrap()
+    }
+
+    #[test]
+    fn put_options_control_output_confirmation_without_losing_batching() {
+        Engine::init();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        asyncrt::set_host_handle(runtime.handle().clone());
+        let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel();
+        GATE_TX.set(gate_tx).unwrap();
+        let cells = storage::Cells::default();
+        let _installed = cells.install();
+        let mut isolate = v8::Isolate::new(Default::default());
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+        isolate.set_slot(Arc::new(ActorRuntimeState::default()));
+        v8::scope!(let hs, &mut isolate);
+        let context = v8::Context::new(hs, Default::default());
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+        install_ops(tc);
+        // Execute the shipping storage classes with their real native ops and SQLite.
+        let harness = include_str!("js/harness.js");
+        let classes = &harness[harness.find("class SqlStorage {").unwrap()
+            ..harness.find("class DurableObjectId {").unwrap()];
+        eval(tc, &format!("{classes}\nglobalThis.makeStorage = scope => new DurableObjectStorage(scope, {{_aborted:false}});"));
+
+        for (index, (source, confirmed, count)) in [
+            ("s.put('a', 1, {allowUnconfirmed:true})", false, 1),
+            ("s.put({a:1,b:2}, {allowUnconfirmed:true})", false, 2),
+            ("Promise.all([s.put('a',1,{allowUnconfirmed:true}),s.put('b',2,{allowUnconfirmed:true})])", false, 2),
+            ("s.put('a', 1)", true, 1),
+            ("s.put({a:1,b:2})", true, 2),
+            ("s.put('a',1,{allowUnconfirmed:false})", true, 1),
+            ("Promise.all([s.put('a',1),s.put('b',2,{allowUnconfirmed:true})])", true, 2),
+            ("Promise.all([s.put('a',1,{allowUnconfirmed:true}),s.put('b',2)])", true, 2),
+        ].into_iter().enumerate() {
+            let cell = format!("put-{index}");
+            storage::open(&cell, ":memory:").unwrap();
+            let before = storage::event_start_position(&cell).unwrap();
+            let context = IoContext::new();
+            context.egress.lock().unwrap().push(EgressFrame { storage: cell.clone(), before, root: None });
+            let _event = CurrentGuard::enter(context.clone());
+            eval(tc, &format!("globalThis.s = makeStorage('{cell}');"));
+            let promise = eval(tc, &format!("return {source};"));
+            let promise = v8::Local::<v8::Promise>::try_from(promise).unwrap();
+            assert_eq!(promise.state(), v8::PromiseState::Pending);
+            assert!(storage::get_stored(&cell, "a").unwrap().is_none());
+            assert!(gate_rx.try_recv().is_err(), "nothing may be published before commit");
+            tc.perform_microtask_checkpoint();
+            assert_eq!(promise.state(), v8::PromiseState::Fulfilled, "{source}");
+            assert!(storage::get_stored(&cell, "a").unwrap().is_some());
+            assert_eq!(storage::get_stored(&cell, "b").unwrap().is_some(), count == 2);
+            if !confirmed {
+                let background = gate_rx.try_recv().expect("unconfirmed puts must request replication without sync()");
+                assert_eq!(background.scope, cell);
+                assert_eq!(background.ticket.channel, celld_logic::Channel::Sync);
+                assert_eq!(background.ticket.position, Some(storage::sync_sample(&cell).unwrap().unwrap().position));
+                assert!(background.reply.is_closed(), "the put must not await this proof");
+            }
+            let position = storage::write_position(&cell).unwrap().unwrap();
+            assert_eq!(position > before, confirmed, "{source}");
+            let (write, observed) = gate_positions(&cell, Some(before)).unwrap();
+            assert_eq!(write.is_some(), confirmed, "{source}");
+            assert!(observed.is_none());
+            let later = storage::event_start_position(&cell);
+            let (write, observed) = gate_positions(&cell, later).unwrap();
+            assert!(write.is_none());
+            assert_eq!(observed.is_some(), confirmed, "a subsequent reader: {source}");
+            assert_eq!(matches!(egress_gate_request(&context, celld_logic::Channel::Fetch), EgressGate::Wrote(..)), confirmed);
+
+            // Drive the real sync op manually: no executor scheduling or elapsed-time assertions.
+            let sync = v8::Local::<v8::Promise>::try_from(eval(tc, "return s.sync();")).unwrap();
+            tc.perform_microtask_checkpoint();
+            assert_eq!(sync.state(), v8::PromiseState::Pending);
+            let mut ops = asyncrt::drain_spawns();
+            assert_eq!(ops.len(), 1);
+            let (id, mut future, _, _) = ops.pop().unwrap();
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            let gate = gate_rx.try_recv().unwrap();
+            assert_eq!(gate.ticket.channel, celld_logic::Channel::Sync);
+            assert_eq!(gate.ticket.position, Some(storage::sync_sample(&cell).unwrap().unwrap().position));
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(sync.state(), v8::PromiseState::Pending);
+            let fail = index == 2;
+            gate.reply.send(if fail { Err(celld_logic::RequestError::DurabilityUnproven) } else { Ok(()) }).unwrap();
+            let Poll::Ready(result) = future.as_mut().poll(&mut cx) else { panic!("proof must settle sync") };
+            resolve_res(tc, id, result);
+            tc.perform_microtask_checkpoint();
+            assert_eq!(sync.state(), if fail { v8::PromiseState::Rejected } else { v8::PromiseState::Fulfilled });
+            if !confirmed {
+                // sync still sees every physical write; ordinary SQL restores gating.
+                assert!(storage::sync_sample(&cell).unwrap().unwrap().position > before);
+                storage::sql_exec(&cell, "CREATE TABLE ordinary (id INTEGER)", &[]).unwrap();
+                let required = storage::write_position(&cell).unwrap().unwrap();
+                assert!(required > before);
+                // Consecutive unconfirmed batches must preserve the prior ordinary write.
+                for _ in 0..2 {
+                    let put = v8::Local::<v8::Promise>::try_from(eval(tc, "return s.put('next',2,{allowUnconfirmed:true});")).unwrap();
+                    tc.perform_microtask_checkpoint();
+                    assert_eq!(put.state(), v8::PromiseState::Fulfilled);
+                    assert_eq!(storage::write_position(&cell).unwrap(), Some(required));
+                    assert_eq!(storage::observed_position(&cell, Some(required)), Some(required));
+                    assert_eq!(gate_rx.try_recv().unwrap().scope, cell);
+                }
+            }
+            storage::close(&cell);
+        }
+
+        // If the queue stops coalescing these writes, 'a' would survive the rejected 'b'.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic.sqlite");
+        storage::open("atomic", path.to_str().unwrap()).unwrap();
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "CREATE TRIGGER reject_b BEFORE INSERT ON _cf_KV WHEN NEW.k='b' BEGIN SELECT RAISE(ABORT, 'reject b'); END"
+        ).unwrap();
+        eval(tc, "globalThis.s = makeStorage('atomic');");
+        let batch = v8::Local::<v8::Promise>::try_from(eval(tc,
+            "return Promise.all([s.put('a',1,{allowUnconfirmed:true}), s.put('b',2,{allowUnconfirmed:true})]);"
+        )).unwrap();
+        tc.perform_microtask_checkpoint();
+        assert_eq!(batch.state(), v8::PromiseState::Rejected);
+        assert!(storage::get_stored("atomic", "a").unwrap().is_none());
+        assert!(storage::get_stored("atomic", "b").unwrap().is_none());
+        assert!(
+            gate_rx.try_recv().is_err(),
+            "failed batches must not request a proof"
+        );
+        storage::close("atomic");
+
+        for action in ["commit", "rollback"] {
+            storage::open("transaction", ":memory:").unwrap();
+            eval(tc, "globalThis.s = makeStorage('transaction'); globalThis.savepoint = s._transactionStart();");
+            let put = v8::Local::<v8::Promise>::try_from(eval(
+                tc,
+                "return s.put('a',1,{allowUnconfirmed:true});",
+            ))
+            .unwrap();
+            tc.perform_microtask_checkpoint();
+            assert_eq!(put.state(), v8::PromiseState::Fulfilled);
+            assert!(
+                gate_rx.try_recv().is_err(),
+                "an open transaction cannot be proven"
+            );
+            eval(
+                tc,
+                &format!(
+                    "s.{}(savepoint);",
+                    if action == "commit" {
+                        "_transactionCommit"
+                    } else {
+                        "_transactionRollback"
+                    }
+                ),
+            );
+            assert_eq!(
+                storage::get_stored("transaction", "a").unwrap().is_some(),
+                action == "commit"
+            );
+            if action == "commit" {
+                let background = gate_rx
+                    .try_recv()
+                    .expect("outer commit must request the deferred proof");
+                assert_eq!(
+                    background.ticket.position,
+                    Some(
+                        storage::sync_sample("transaction")
+                            .unwrap()
+                            .unwrap()
+                            .position
+                    )
+                );
+            } else {
+                assert!(
+                    gate_rx.try_recv().is_err(),
+                    "rollback must not request a proof"
+                );
+            }
+            storage::close("transaction");
+        }
+    }
+}

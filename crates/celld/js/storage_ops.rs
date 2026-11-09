@@ -135,7 +135,7 @@ pub(super) fn op_storage_queue_put_serialized(
         throw_storage_error(scope, "put", "serialized row must be bytes");
         return;
     };
-    queue_serialized_puts(scope, cell, vec![(key, bytes)]);
+    queue_serialized_puts(scope, cell, vec![(key, bytes)], args.get(3).is_true());
 }
 
 pub(super) fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeState> {
@@ -145,14 +145,20 @@ pub(super) fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeS
         .clone()
 }
 
-fn queue_serialized_puts(scope: &mut v8::PinScope, cell: String, entries: Vec<(String, Vec<u8>)>) {
-    actor_runtime_state(scope)
+fn queue_serialized_puts(
+    scope: &mut v8::PinScope,
+    cell: String,
+    entries: Vec<(String, Vec<u8>)>,
+    allow_unconfirmed: bool,
+) {
+    let state = actor_runtime_state(scope);
+    let mut pending = state
         .pending_puts
         .lock()
-        .expect("pending puts lock poisoned")
-        .entry(cell)
-        .or_default()
-        .extend(entries);
+        .expect("pending puts lock poisoned");
+    let batch = pending.entry(cell).or_default();
+    batch.0.extend(entries);
+    batch.1 |= !allow_unconfirmed;
 }
 
 pub(super) fn op_storage_queue_put(
@@ -165,7 +171,7 @@ pub(super) fn op_storage_queue_put(
     let Some(value) = serialize_storage_value(scope, args.get(2)) else {
         return;
     };
-    queue_serialized_puts(scope, cell, vec![(key, value)]);
+    queue_serialized_puts(scope, cell, vec![(key, value)], args.get(3).is_true());
 }
 
 pub(super) fn op_storage_queue_put_many(
@@ -198,7 +204,7 @@ pub(super) fn op_storage_queue_put_many(
         };
         serialized.push((key.to_rust_string_lossy(scope), value));
     }
-    queue_serialized_puts(scope, cell, serialized);
+    queue_serialized_puts(scope, cell, serialized, args.get(2).is_true());
 }
 
 pub(super) fn op_storage_flush_pending_puts(
@@ -213,7 +219,7 @@ pub(super) fn op_storage_flush_pending_puts(
 }
 
 fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String> {
-    let entries = actor_runtime_state(scope)
+    let (entries, requires_confirmation) = actor_runtime_state(scope)
         .pending_puts
         .lock()
         .expect("pending puts lock poisoned")
@@ -222,7 +228,39 @@ fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String
     if entries.is_empty() {
         return Ok(());
     }
-    storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string())
+    let before = if requires_confirmation {
+        None
+    } else {
+        storage::write_position(cell).map_err(|error| error.to_string())?
+    };
+    storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string())?;
+    if let Some(before) = before {
+        storage::mark_unconfirmed(cell, before);
+        queue_unconfirmed_sync(cell);
+    }
+    Ok(())
+}
+
+// The host owns this proof even after its unused reply receiver is dropped.
+fn queue_unconfirmed_sync(cell: &str) {
+    if let (Some(tx), Ok(Some(sample))) = (GATE_TX.get(), storage::sync_sample(cell)) {
+        if !sample.in_transaction
+            && storage::embedded_root_gate(cell).is_none()
+            && storage::write_position(cell).ok().flatten() != Some(sample.position)
+        {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            let _ = tx.send(GateReq {
+                reply,
+                scope: cell.into(),
+                ticket: crate::actor::GateTicket {
+                    channel: celld_logic::Channel::Sync,
+                    epoch: Some(sample.epoch),
+                    observed: None,
+                    position: Some(sample.position),
+                },
+            });
+        }
+    }
 }
 
 /// `storage.sync()`: resolve once every write the cell committed before the
@@ -725,6 +763,9 @@ pub(super) fn op_storage_transaction_control(
     // flushing after rollback would commit the canceled writes outside it.
     let result = flush_pending_puts(scope, &cell)
         .and_then(|()| storage::transaction_control(&cell, &action, nested, &savepoint));
+    if result.is_ok() && action == "commit" {
+        queue_unconfirmed_sync(&cell);
+    }
     if let Some(timing_started) = timing_started {
         tracing::debug!(
             target: "queue_timing",

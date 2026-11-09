@@ -1616,14 +1616,15 @@ class DurableObjectStorage {
         __storage_get(this._scope, k, __storedSentinel));
     });
   }
-  async put(k, val) {
+  async put(k, val, options) {
     this._assertTransactionActive("put");
+    const allowUnconfirmed = (typeof k === "string" ? options : val)?.allowUnconfirmed === true;
     if (typeof k === "string") {
       try {
-        __storage_queue_put(this._scope, k, val);
+        __storage_queue_put(this._scope, k, val, allowUnconfirmed);
       } catch (error) {
         __storage_queue_put_serialized(this._scope, k,
-                                       __storedBytes(val, error));
+                                       __storedBytes(val, error), allowUnconfirmed);
       }
       await Promise.resolve();
       this._flushPendingPuts();
@@ -1634,7 +1635,7 @@ class DurableObjectStorage {
     const entries =
       source.map(([key, value]) => [String(key), value]);
     try {
-      __storage_queue_put_many(this._scope, entries);
+      __storage_queue_put_many(this._scope, entries, allowUnconfirmed);
     } catch (error) {
       // A batch with a stub entry: encode every entry first (plain
       // entries keep their native clone bytes, stub entries take
@@ -1649,7 +1650,7 @@ class DurableObjectStorage {
         }
       });
       for (const [key, bytes] of encoded)
-        __storage_queue_put_serialized(this._scope, key, bytes);
+        __storage_queue_put_serialized(this._scope, key, bytes, allowUnconfirmed);
     }
     await Promise.resolve();
     this._flushPendingPuts();

@@ -89,6 +89,8 @@ struct OpenCell {
     /// read-only answer reports what it observed only above it, and a reader
     /// on a cell no handler has written asks for no proof.
     published_position: Option<u64>,
+    /// An unconfirmed tail's physical position and the earlier position output owes.
+    unconfirmed_position: Option<(u64, u64)>,
 }
 
 enum StorageBacking {
@@ -878,6 +880,7 @@ fn finish_open(
                 replicated_wake,
                 backing,
                 published_position: None,
+                unconfirmed_position: None,
             },
         )
     });
@@ -1280,7 +1283,7 @@ fn schema_version(connection: &Connection) -> u64 {
         .unwrap_or(0) as u64
 }
 
-/// The cell's committed-write position: SQLite's total completed row changes,
+/// The cell's output-required position: SQLite's total completed row changes,
 /// data version, and schema cookie, monotonic for the life of the activation.
 /// The output gate samples it around a handler to tell a write from a read.
 /// The data version detects a legacy facet image deleted through a second
@@ -1292,9 +1295,27 @@ fn schema_version(connection: &Connection) -> u64 {
 pub fn write_position(scope: &str) -> anyhow::Result<Option<u64>> {
     with(scope, |c| {
         ensure_no_unfinished_write_cursor(c)?;
-        Ok(fingerprint(scope, c))
+        let current = fingerprint(scope, c);
+        let tail = dbs(|d| {
+            d.borrow()
+                .get(scope)
+                .and_then(|cell| cell.unconfirmed_position)
+        });
+        Ok(match tail {
+            Some((after, before)) if after == current => before,
+            _ => current,
+        })
     })
     .transpose()
+}
+
+/// Exempt only this committed tail; any subsequent ordinary write changes its fingerprint.
+pub(crate) fn mark_unconfirmed(scope: &str, before: u64) {
+    dbs(|d| {
+        if let Some(cell) = d.borrow_mut().get_mut(scope) {
+            cell.unconfirmed_position = Some((fingerprint(scope, &cell.connection), before));
+        }
+    })
 }
 
 fn fingerprint(scope: &str, connection: &Connection) -> u64 {
@@ -1370,7 +1391,7 @@ pub struct SyncSample {
     /// autocommit is exactly a storage transaction a handler has not
     /// finished.
     pub in_transaction: bool,
-    /// The cell's committed-write position, as `write_position` reports it.
+    /// The full physical position, including writes exempted from the output gate.
     pub position: u64,
     /// The activation epoch the connection was installed with.
     pub epoch: u64,
@@ -1386,8 +1407,7 @@ pub fn sync_sample(scope: &str) -> anyhow::Result<Option<SyncSample>> {
                 ensure_no_unfinished_write_cursor(&cell.connection)?;
                 Ok(SyncSample {
                     in_transaction: !cell.connection.is_autocommit(),
-                    position: total_changes(&cell.connection)
-                        + schema_cookie(scope, &cell.connection),
+                    position: fingerprint(scope, &cell.connection),
                     epoch: cell.epoch,
                 })
             })
