@@ -27,6 +27,7 @@ An unsupported feature that does not cause an error is a defect.
 | [D1](services/d1.md) | **Yes** |
 | [Workflows](services/workflows.md) | **Yes** |
 | [R2](services/r2.md) | **Yes** |
+| [Secrets Store](services/secrets.md) | **Yes** — `get()` bindings; provider URI store IDs are celld-specific |
 | Workers AI | **No** |
 | Vectorize | **No** |
 | Hyperdrive | **No** |

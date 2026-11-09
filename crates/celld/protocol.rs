@@ -74,7 +74,10 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
     FEATURE_PYTHON_WORKERS_V1,
+    FEATURE_SECRETS_STORE_V1,
 ];
+
+pub const FEATURE_SECRETS_STORE_V1: &str = "secrets-store-v1";
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
 /// A deployment with `containers`. Required because a build without the

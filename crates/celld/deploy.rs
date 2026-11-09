@@ -56,6 +56,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "queues",
     "workflows",
     "r2_buckets",
+    "secrets_store_secrets",
     "worker_loaders",
     "containers",
     "no_bundle",
@@ -318,6 +319,7 @@ struct Project {
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
     has_r2: bool,
+    has_secrets: bool,
     containers: Vec<ContainerDecl>,
     /// Set when `main` is a `.py` file: the Python behavior its
     /// compatibility date and flags select.
@@ -551,6 +553,10 @@ impl Built {
                         format!("env.{name} (Text)"),
                         "Environment Variable".to_string(),
                     )),
+                    Some("secrets_store_secret") => Some((
+                        format!("env.{name} (Secrets Store)"),
+                        binding.get("store_id")?.as_str()?.to_string(),
+                    )),
                     _ => None,
                 }
             })
@@ -729,6 +735,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.has_r2 {
                 features.push(FEATURE_R2_V1.to_string());
+            }
+            if project.has_secrets {
+                features.push(crate::protocol::FEATURE_SECRETS_STORE_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -1875,6 +1884,34 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             "name": binding,
         }));
     }
+    let secret_bindings = match object.get("secrets_store_secrets") {
+        None => &[][..],
+        Some(Value::Array(entries)) => entries.as_slice(),
+        Some(_) => bail!("config `secrets_store_secrets` must be an array"),
+    };
+    for entry in secret_bindings {
+        let fields = entry
+            .as_object()
+            .context("each secrets_store_secrets entry must be an object")?;
+        for key in fields.keys() {
+            if !matches!(key.as_str(), "binding" | "store_id" | "secret_name") {
+                bail!("unsupported secrets_store_secrets option: {key}");
+            }
+        }
+        let binding: celld_secrets::SecretBinding = serde_json::from_value(entry.clone())
+            .context("secret binding requires binding, store_id, and secret_name strings")?;
+        if !valid_binding(&binding.name) || binding.secret_name.is_empty() {
+            bail!(
+                "invalid secret binding {:?}: binding and secret_name must be nonempty",
+                binding.name
+            );
+        }
+        celld_secrets::store_scheme(&binding.store_id)?;
+        bindings.push(json!({
+            "type": "secrets_store_secret", "name": binding.name,
+            "store_id": binding.store_id, "secret_name": binding.secret_name,
+        }));
+    }
     let mut vars = BTreeMap::new();
     match object.get("vars") {
         None => {}
@@ -1939,6 +1976,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             || !sqlite_classes.is_empty()
             || service_count > 0
             || declared_vars
+            || !secret_bindings.is_empty()
             || !r2_binding_names.is_empty()
             || !worker_loaders.is_empty())
     {
@@ -2010,6 +2048,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
+        has_secrets: !secret_bindings.is_empty(),
         containers,
         python,
     })
@@ -3040,4 +3079,51 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod secrets_tests {
+    use super::*;
+
+    fn project(extra: Value) -> anyhow::Result<Project> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(
+            root.path().join("index.js"),
+            "export default { fetch() {} }",
+        )?;
+        let mut config = json!({"name":"secrets-test", "main":"index.js"});
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let path = root.path().join("wrangler.json");
+        std::fs::write(&path, config.to_string())?;
+        read_project(&path, root.path(), &VarOverrides::None)
+    }
+
+    #[test]
+    fn accepts_a_provider_reference_as_a_secret_binding() {
+        let project = project(json!({"secrets_store_secrets":[{
+            "binding":"API_KEY", "store_id":"op://production", "secret_name":"stripe/api-key"
+        }]}))
+        .unwrap();
+        let binding = &project.metadata["bindings"][0];
+        assert_eq!(binding["type"], "secrets_store_secret");
+        assert_eq!(binding["store_id"], "op://production");
+        assert_eq!(binding["secret_name"], "stripe/api-key");
+    }
+
+    #[test]
+    fn secret_bindings_participate_in_existing_duplicate_name_validation() {
+        let result = project(
+            json!({"vars":{"API_KEY":"plain"}, "secrets_store_secrets":[{
+                "binding":"API_KEY", "store_id":"op://production", "secret_name":"stripe/api-key"
+            }]}),
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("every name in `env` must be unique"));
+    }
 }

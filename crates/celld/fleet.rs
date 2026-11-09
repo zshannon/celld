@@ -891,6 +891,10 @@ async fn load_worker_at_pointer(
             })
         })
         .collect();
+    let secret_bindings = bindings(&manifest, "secrets_store_secret")
+        .map(|binding| serde_json::from_value(binding.clone()))
+        .collect::<Result<Vec<celld_secrets::SecretBinding>, _>>()
+        .context("decode secret bindings")?;
     // The `worker_loaders` key of the deployed config. Every entry becomes a
     // binding of its own, because each loader caches the Workers it loaded.
     let loader_bindings = bindings(&manifest, "worker_loader")
@@ -939,6 +943,7 @@ async fn load_worker_at_pointer(
             r2_bindings,
             d1_bindings,
             kv_bindings,
+            secret_bindings,
             queue_bindings,
             queue_consumers: manifest.queue_consumers,
             workflow_bindings,

@@ -31,6 +31,7 @@ enum MetricsBackend {
 pub struct HostServices {
     domain: OnceLock<crate::asyncrt::DomainToken>,
     node_load: OnceLock<Arc<LiveLoad>>,
+    secrets: OnceLock<Arc<celld_secrets::Registry>>,
     wake_entry: crate::js::WakeEntryService,
     websockets: crate::js::WebSocketService,
     http_streams: Arc<crate::js::HttpStreamService>,
@@ -44,6 +45,7 @@ impl HostServices {
         Self {
             domain: OnceLock::new(),
             node_load: OnceLock::new(),
+            secrets: OnceLock::new(),
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
             http_streams: Arc::new(crate::js::HttpStreamService::default()),
@@ -58,6 +60,7 @@ impl HostServices {
         Self {
             domain: OnceLock::new(),
             node_load: OnceLock::new(),
+            secrets: OnceLock::new(),
             wake_entry: crate::js::WakeEntryService::default(),
             websockets: crate::js::WebSocketService::default(),
             http_streams: Arc::new(crate::js::HttpStreamService::default()),
@@ -65,6 +68,18 @@ impl HostServices {
             #[cfg(all(test, celld_internal_tests))]
             handoff_transport: Mutex::new(None),
         }
+    }
+
+    pub fn set_secret_providers(&self, providers: Arc<celld_secrets::Registry>) {
+        self.secrets
+            .set(providers)
+            .unwrap_or_else(|_| panic!("secret providers already installed"));
+    }
+
+    pub fn secrets(&self) -> Arc<celld_secrets::Registry> {
+        self.secrets
+            .get_or_init(|| Arc::new(celld_secrets::Registry::default()))
+            .clone()
     }
 
     pub fn set_node_load(&self, load: Arc<LiveLoad>) {

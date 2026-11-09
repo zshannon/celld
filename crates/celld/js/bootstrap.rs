@@ -636,6 +636,12 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 celld_logic::kv::cell_name(id, 0),
             ));
         }
+        for binding in &config.secret_bindings {
+            lines.push_str(&format!(
+                "e[{:?}] = __celld.__makeSecretsStoreSecret({:?});\n",
+                binding.name, binding.name,
+            ));
+        }
         for binding in queue_bindings {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeQueue({:?}, {:?}, {});\n",

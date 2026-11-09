@@ -3628,6 +3628,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         Action::Run(settings) => settings,
     };
+    celld::asyncrt::services().set_secret_providers(Arc::new(celld::secrets::from_env()?));
     // Operators need the applied worker count to verify CELLD_TOKIO_THREADS;
     // a count of process threads also includes unrelated, lazily started
     // thread pools, so it cannot stand in for this value.
@@ -3989,6 +3990,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 r2_bindings,
                 d1_bindings,
                 kv_bindings,
+                secret_bindings: Vec::new(),
                 queue_bindings,
                 queue_consumers: Vec::new(),
                 workflow_bindings,
